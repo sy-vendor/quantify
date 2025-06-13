@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>加密货币市场AI分析工具</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 20px; background-color: #f8f9fa; color: #343a40; }
+        .container { max-width: 900px; margin: 0 auto; background-color: #ffffff; padding: 30px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08); }
+        h1, h2 { color: #007bff; text-align: center; margin-bottom: 25px; }
+        .form-group { margin-bottom: 20px; }
+        label { display: block; margin-bottom: 8px; font-weight: bold; color: #495057; }
+        input[type="text"], textarea {
+            width: calc(100% - 20px);
+            padding: 12px;
+            border: 1px solid #ced4da;
+            border-radius: 5px;
+            font-size: 1rem;
+            box-sizing: border-box;
+            background-color: #e9ecef; /* Slightly darker background for input */
+        }
+        .radio-group label {
+            display: inline-block;
+            margin-right: 15px;
+            font-weight: normal;
+        }
+        button {
+            display: block;
+            width: 100%;
+            padding: 12px 20px;
+            background-color: #007bff;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            font-size: 1.1rem;
+            cursor: pointer;
+            transition: background-color 0.3s ease;
+        }
+        button:hover { background-color: #0056b3; }
+        #analysis-result {
+            margin-top: 30px;
+            padding: 20px;
+            background-color: #e9ecef;
+            border-radius: 8px;
+            border: 1px solid #dee2e6;
+            min-height: 150px;
+            overflow-x: auto; /* Allow horizontal scrolling for wide content */
+        }
+        #analysis-result pre {
+            margin: 0;
+            padding: 0;
+            white-space: pre-wrap; /* 自动换行 */
+            word-wrap: break-word; /* 单词内部断开 */
+            font-size: 0.95rem;
+            line-height: 1.6;
+        }
+        #loading-message {
+            text-align: center;
+            font-size: 1.1rem;
+            color: #6c757d;
+            margin-top: 20px;
+            display: none; /* Hidden by default */
+        }
+        .error-message {
+            color: #dc3545;
+            font-weight: bold;
+            text-align: center;
+            margin-top: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>加密货币市场AI分析工具</h1>
+
+        <div class="form-group">
+            <label for="symbol">币种符号 (例如: BTCUSDT, LPTUSDT):</label>
+            <input type="text" id="symbol" value="LPTUSDT" placeholder="输入币种符号" required>
+        </div>
+
+        <div class="form-group">
+            <label for="obv">OBV 数据:</label>
+            <input type="text" id="obv" value="-4,059,281.200" placeholder="OBV -4,059,281.200">
+        </div>
+
+        <div class="form-group">
+            <label for="ls_acco">L.S Acco 数据:</label>
+            <input type="text" id="ls_acco" value="0.94 L 48.53% S 51.47%" placeholder="LS Acco 0.94 L 48.53% S 51.47%">
+        </div>
+
+        <div class="form-group">
+            <label for="oi_data">O.I. 数据:</label>
+            <input type="text" id="oi_data" value="2.21M O.I.NV:15.5M" placeholder="O.i:2.21M O.I.NV:15.5M">
+        </div>
+
+        <div class="form-group radio-group">
+            <label>选择 AI 提供者:</label>
+            <input type="radio" id="gemini" name="provider" value="gemini" checked>
+            <label for="gemini">Gemini</label>
+            <input type="radio" id="deepseek" name="provider" value="deepseek">
+            <label for="deepseek">DeepSeek</label>
+        </div>
+
+        <button onclick="getAnalysis()">获取AI分析</button>
+
+        <div id="loading-message">
+            <p>正在获取分析结果，请稍候...</p>
+        </div>
+
+        <h2>AI 分析结果</h2>
+        <div id="analysis-result">
+            <pre>分析结果将显示在这里。</pre>
+        </div>
+    </div>
+
+    <script>
+        async function getAnalysis() {
+            const symbol = document.getElementById('symbol').value;
+            const obv = document.getElementById('obv').value;
+            const lsAcco = document.getElementById('ls_acco').value;
+            const oiData = document.getElementById('oi_data').value;
+            const provider = document.querySelector('input[name="provider"]:checked').value;
+            const resultDiv = document.getElementById('analysis-result');
+            const loadingMessage = document.getElementById('loading-message');
+
+            if (!symbol) {
+                resultDiv.innerHTML = '<p class="error-message">请输入币种符号！</p>';
+                return;
+            }
+
+            loadingMessage.style.display = 'block'; // Show loading message
+            resultDiv.innerHTML = '<pre>正在请求数据...</pre>'; // Clear previous result
+
+            // 构建 extra_indicators 字符串
+            let extraIndicators = "";
+            if (obv) extraIndicators += `OBV: ${obv} `;
+            if (lsAcco) extraIndicators += `LS Acco: ${lsAcco} `;
+            if (oiData) extraIndicators += `O.I. Data: ${oiData}`;
+            
+            // 构建 API URL，对 extra_indicators 进行 URL 编码
+            const API_BASE_URL = 'http://127.0.0.1:5001/analyze';
+            const params = new URLSearchParams({
+                symbol: symbol,
+                provider: provider
+            });
+            if (extraIndicators) {
+                params.append('extra_indicators', extraIndicators.trim());
+            }
+
+            const url = `${API_BASE_URL}?${params.toString()}`;
+
+            try {
+                const response = await fetch(url);
+                if (!response.ok) {
+                    const errorText = await response.text();
+                    throw new Error(`API 请求失败: ${response.status} ${response.statusText} - ${errorText}`);
+                }
+                const data = await response.json();
+
+                loadingMessage.style.display = 'none'; // Hide loading message
+
+                if (data && data.ai_analysis) {
+                    // 使用 <pre> 标签来保留原始文本格式（包括换行）
+                    resultDiv.innerHTML = `<pre>${data.ai_analysis}</pre>`;
+                } else {
+                    resultDiv.innerHTML = '<p class="error-message">AI 未返回分析结果，请检查API响应。</p>';
+                }
+                console.log('API 响应数据:', data);
+            } catch (error) {
+                loadingMessage.style.display = 'none'; // Hide loading message
+                resultDiv.innerHTML = `<p class="error-message">加载分析时出错: ${error.message}</p>`;
+                console.error('Error fetching data:', error);
+            }
+        }
+    </script>
+</body>
+</html>
