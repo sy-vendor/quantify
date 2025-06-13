@@ -1,238 +1,307 @@
 import os
-from flask import Flask, request, jsonify, make_response
+import json
+from datetime import datetime, timedelta
+
+import numpy as np
 import pandas as pd
 import pandas_ta as ta
 from binance.client import Client
-from datetime import datetime, timedelta
+from dotenv import load_dotenv
+from flask import Flask, jsonify, request
 import openai
 import google.generativeai as genai
-from dotenv import load_dotenv
-import numpy as np
-import json  # 添加在文件顶部的导入部分
 
-# --- 1. 初始化与设置 ---
+# --- 1. 初始化與設定 ---
 
-# 加载 .env 文件中的环境变量
+# 從 .env 檔案載入環境變數
 load_dotenv()
 
-# 初始化 Flask 应用
+# 初始化 Flask 應用
 app = Flask(__name__)
-app.config['JSON_AS_ASCII'] = False  # 确保 JSON 响应支持中文
-app.json.ensure_ascii = False  # 确保 JSON 响应支持中文
+# 確保 JSON 回應能正確顯示中文
+app.config['JSON_AS_ASCII'] = False
 
-# 从环境变量读取 API 密钥
+# --- API 金鑰與客戶端設定 ---
+
+# 從環境變數讀取金鑰
 deepseek_api_key = os.getenv("DEEPSEEK_API_KEY")
 gemini_api_key = os.getenv("GEMINI_API_KEY")
 binance_api_key = os.getenv("BINANCE_API_KEY")
 binance_api_secret = os.getenv("BINANCE_API_SECRET")
 
+# 檢查必要的 Gemini 金鑰
 if not gemini_api_key:
-    raise ValueError("请在 .env 文件中设置 GEMINI_API_KEY")
+    raise ValueError("錯誤: 必須在 .env 檔案中設定 GEMINI_API_KEY")
 
-# 初始化币安客户端
+# 初始化幣安客戶端，包含錯誤處理與回退機制
+binance_client = None
 try:
-    # 使用测试网络
-    binance_client = Client(binance_api_key, binance_api_secret, testnet=True)
-    # 测试连接
-    binance_client.ping()
-    print("成功连接到币安测试网络")
+    # 優先使用提供的 API 金鑰連接到測試網路
+    if binance_api_key and binance_api_secret:
+        client = Client(binance_api_key, binance_api_secret, testnet=True)
+        client.ping()
+        binance_client = client
+        print("成功連接到幣安測試網路 (使用 API Key)。")
+    else:
+        # 如果沒有提供金鑰，嘗試使用公共端點連接
+        client = Client("", "", testnet=True)
+        client.ping()
+        binance_client = client
+        print("成功連接到幣安公共 API (無需 API Key)。")
 except Exception as e:
-    print(f"警告: 币安 API 初始化失败: {e}")
-    print("尝试使用公共 API 端点...")
-    try:
-        # 尝试使用公共 API 端点
-        binance_client = Client("", "", testnet=True)
-        binance_client.ping()
-        print("成功连接到币安公共 API")
-    except Exception as e:
-        print(f"警告: 公共 API 连接也失败: {e}")
-        binance_client = None
+    print(f"警告: 連接幣安 API 失敗: {e}。所有數據請求將使用模擬數據。")
 
-# 初始化 DeepSeek 客户端 (使用 OpenAI 套件)
-# if deepseek_api_key:
-#     deepseek_client = openai.OpenAI(api_key=deepseek_api_key, base_url="https://api.deepseek.com/v1")
-# else:
+# 初始化 AI 客戶端
 deepseek_client = None
+if deepseek_api_key:
+    deepseek_client = openai.OpenAI(api_key=deepseek_api_key, base_url="https://api.deepseek.com/v1")
+else:
+    print("警告: 未設定 DEEPSEEK_API_KEY，DeepSeek 相關功能將不可用。")
 
-# 设置 Gemini API
 genai.configure(api_key=gemini_api_key)
 gemini_model = genai.GenerativeModel('gemini-1.5-flash-latest')
 
+# --- 2. 輔助函式 (Helpers) ---
 
-# --- 2. 辅助函数 (Helpers) ---
-
-def get_market_data_with_indicators(symbol: str) -> pd.DataFrame:
-    """从币安获取数据并计算技术指标，返回一个 DataFrame。"""
-    if not binance_client:
-        print("使用模拟数据...")
-        # 生成模拟数据
-        dates = pd.date_range(end=datetime.now(), periods=365, freq='D')
-        data = pd.DataFrame({
-            'Date': dates.strftime('%Y-%m-%d'),
-            'Open': np.random.normal(50000, 1000, 365),
-            'High': np.random.normal(51000, 1000, 365),
-            'Low': np.random.normal(49000, 1000, 365),
-            'Close': np.random.normal(50000, 1000, 365),
-            'Volume': np.random.normal(1000, 100, 365)
-        })
-    else:
-        try:
-            start_date = (datetime.now() - timedelta(days=365)).strftime("%d %b, %Y")
-            klines = binance_client.get_historical_klines(symbol.upper(), Client.KLINE_INTERVAL_1DAY, start_date)
-            if not klines: 
-                raise ValueError(f"无法获取 {symbol} 的历史数据")
-
-            columns = ['Open time', 'Open', 'High', 'Low', 'Close', 'Volume', 'Close time', 'Quote asset volume', 'Number of trades', 'Taker buy base asset volume', 'Taker buy quote asset volume', 'Ignore']
-            data = pd.DataFrame(klines, columns=columns)
-            
-            data = data[['Open time', 'Open', 'High', 'Low', 'Close', 'Volume']]
-            data['Date'] = pd.to_datetime(data['Open time'], unit='ms').dt.strftime('%Y-%m-%d')
-            for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
-                data[col] = pd.to_numeric(data[col])
-            data.drop('Open time', axis=1, inplace=True)
-        except Exception as e:
-            print(f"获取真实数据失败: {e}")
-            print("使用模拟数据...")
-            # 生成模拟数据
-            dates = pd.date_range(end=datetime.now(), periods=365, freq='D')
-            data = pd.DataFrame({
-                'Date': dates.strftime('%Y-%m-%d'),
-                'Open': np.random.normal(50000, 1000, 365),
-                'High': np.random.normal(51000, 1000, 365),
-                'Low': np.random.normal(49000, 1000, 365),
-                'Close': np.random.normal(50000, 1000, 365),
-                'Volume': np.random.normal(1000, 100, 365)
-            })
-
-    # 计算技术指标
-    # 使用 pandas_ta 的 ta 扩展来计算指标
-    sma20 = data.ta.sma(length=20)
-    sma50 = data.ta.sma(length=50)
-    rsi = data.ta.rsi(length=14)
-    macd = data.ta.macd(fast=12, slow=26, signal=9)
-    
-    # 打印所有指标的列名，用于调试
-    print("SMA20 columns:", sma20.columns.tolist())
-    print("SMA50 columns:", sma50.columns.tolist())
-    print("RSI columns:", rsi.columns.tolist())
-    print("MACD columns:", macd.columns.tolist())
-    
-    # 将指标添加到数据框
-    data['SMA_20'] = sma20.iloc[:, 0]  # 使用第一列
-    data['SMA_50'] = sma50.iloc[:, 0]  # 使用第一列
-    data['RSI_14'] = rsi.iloc[:, 0]    # 使用第一列
-    data['MACD'] = macd.iloc[:, 0]     # MACD 线
-    data['MACD_Signal'] = macd.iloc[:, 1]  # 信号线
-    
-    data.dropna(inplace=True)
+def create_mock_data() -> pd.DataFrame:
+    """當無法獲取真實數據時，生成模擬數據。"""
+    print("回退機制: 正在生成模擬數據...")
+    dates = pd.to_datetime(pd.date_range(end=datetime.now(), periods=365, freq='D'))
+    data = pd.DataFrame({'Date': dates})
+    data['Open'] = np.random.normal(loc=50000, scale=1500, size=365).cumsum() + 50000
+    data['High'] = data['Open'] + np.random.uniform(0, 2000, 365)
+    data['Low'] = data['Open'] - np.random.uniform(0, 2000, 365)
+    data['Close'] = (data['High'] + data['Low']) / 2
+    data['Volume'] = np.random.normal(loc=1000, scale=200, size=365)
+    data.set_index('Date', inplace=True)
     return data
 
-def call_deepseek(prompt: str) -> str:
-    """调用 DeepSeek API。"""
-    try:
-        response = deepseek_client.chat.completions.create(
-            model="deepseek-chat",
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return response.choices[0].message.content
-    except Exception as e:
-        return f"调用 DeepSeek 时发生错误: {e}"
+def get_market_data_with_indicators(symbol: str) -> pd.DataFrame:
+    """從幣安獲取數據並使用策略計算技術指標。"""
+    data = None
+    if binance_client:
+        try:
+            start_date = (datetime.now() - timedelta(days=500)).strftime("%d %b, %Y") # 多取一些數據以確保指標計算有足夠前期數據
+            klines = binance_client.get_historical_klines(symbol.upper(), Client.KLINE_INTERVAL_1DAY, start_date)
+            if not klines: raise ValueError("API 返回空的 K線數據")
 
-def call_gemini(prompt: str) -> str:
-    """调用 Gemini API。"""
-    try:
-        response = gemini_model.generate_content(prompt)
-        return response.text
-    except Exception as e:
-        return f"调用 Gemini 时发生错误: {e}"
+            cols = ['Open time', 'Open', 'High', 'Low', 'Close', 'Volume', 'Close time', 'Quote asset volume', 'Number of trades', 'Taker buy base asset volume', 'Taker buy quote asset volume', 'Ignore']
+            df = pd.DataFrame(klines, columns=cols)
+            df['Date'] = pd.to_datetime(df['Open time'], unit='ms')
+            df.set_index('Date', inplace=True)
+            
+            # 轉換數據類型為數值
+            for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+            data = df[['Open', 'High', 'Low', 'Close', 'Volume']]
+
+        except Exception as e:
+            print(f"從幣安獲取 '{symbol}' 數據失敗: {e}")
+            data = create_mock_data()
+    else:
+        data = create_mock_data()
+
+    # 定義一個包含所有所需指標的策略
+    MyStrategy = ta.Strategy(
+        name="常用指標組合",
+        description="計算 SMA(20, 50), RSI(14), 和 MACD(12, 26, 9)",
+        ta=[
+            {"kind": "sma", "length": 20},
+            {"kind": "sma", "length": 50},
+            {"kind": "rsi", "length": 14},
+            {"kind": "macd", "fast": 12, "slow": 26, "signal": 9},
+        ]
+    )
+    
+    # 一行程式碼應用策略，自動計算並附加所有指標
+    data.ta.strategy(MyStrategy)
+    
+    # 清理包含 NaN 的行 (通常是數據開頭的部分)
+    data.dropna(inplace=True)
+    data.reset_index(inplace=True)
+    data['Date'] = data['Date'].dt.strftime('%Y-%m-%d')
+    
+    return data
+
+def call_ai_provider(prompt: str, provider: str) -> str:
+    """根據提供者名稱呼叫對應的 AI 模型。"""
+    if provider == 'deepseek':
+        if not deepseek_client:
+            return "錯誤: DeepSeek API 未被正確設定。"
+        try:
+            response = deepseek_client.chat.completions.create(
+                model="deepseek-chat",
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            return f"呼叫 DeepSeek API 時發生錯誤: {e}"
+    
+    elif provider == 'gemini':
+        try:
+            response = gemini_model.generate_content(prompt)
+            return response.text
+        except Exception as e:
+            return f"呼叫 Gemini API 時發生錯誤: {e}"
+            
+    return "錯誤: 無效的 AI 提供者。"
 
 
-# --- 3. API 端点 (Routes) ---
+# --- 3. API 端點 (Routes) ---
 
 @app.route('/')
 def index():
-    return "市场数据与AI分析 API 已启动。请使用 /indicators 或 /analyze 端点。"
+    return "<h2>市場羅盤 API v2.0</h2><p>已成功啟動。請使用 <code>/indicators</code> 或 <code>/analyze</code> 端點。</p>"
 
 @app.route('/indicators', methods=['GET'])
 def get_indicators_endpoint():
-    """仅获取数据和指标。"""
+    """僅獲取數據和指標。"""
     symbol = request.args.get('symbol')
     if not symbol:
-        return jsonify({"error": "必须提供 'symbol' 参数"}), 400
+        return jsonify({"error": "必須提供 'symbol' 參數"}), 400
         
     data = get_market_data_with_indicators(symbol)
     if data is None or data.empty:
-        return jsonify({"error": f"找不到 '{symbol}' 的数据或计算失败。"}), 404
+        return jsonify({"error": f"找不到 '{symbol}' 的數據或計算失敗。"}), 404
         
-    result_df = data.tail(100)
-    return jsonify(result_df.to_dict(orient='records'))
+    # 回傳最新的 100 筆數據
+    return jsonify(json.loads(data.tail(100).to_json(orient='records')))
 
 @app.route('/analyze', methods=['GET'])
 def analyze_market_endpoint():
-    """获取数据、指标，并交由指定的 AI 模型进行分析。"""
+    """獲取數據、指標，並交由指定的 AI 模型進行分析。"""
     symbol = request.args.get('symbol')
-    provider = request.args.get('provider', 'gemini').lower() # 默认使用 gemini
+    provider = request.args.get('provider', 'gemini').lower() # 預設使用 gemini
 
     if not symbol:
-        return jsonify({"error": "必须提供交易对 'symbol' 参数"}), 400
+        return jsonify({"error": "必須提供交易對 'symbol' 參數"}), 400
     if provider not in ['deepseek', 'gemini']:
-        return jsonify({"error": "提供者 'provider' 必须是 'deepseek' 或 'gemini'"}), 400
+        return jsonify({"error": "提供者 'provider' 必須是 'deepseek' 或 'gemini'"}), 400
     if provider == 'deepseek' and not deepseek_client:
-        return jsonify({"error": "DeepSeek API 未配置，请使用 'gemini' 作为提供者"}), 400
+        return jsonify({"error": "DeepSeek API 未配置，請使用 'gemini' 作為提供者"}), 400
 
-    # 1. 获取数据
     data = get_market_data_with_indicators(symbol)
     if data is None or data.empty:
-        return jsonify({"error": f"找不到 '{symbol}' 的数据，无法进行分析。"}), 404
+        return jsonify({"error": f"找不到 '{symbol}' 的數據，無法進行分析。"}), 404
     
-    # 2. 准备 Prompt
     latest_data = data.iloc[-1]
+    
+    # 建立全新的、高度結構化的詳細分析提示詞模板
     prompt = f"""
-    您是一位专精于加密货币的资深技术分析师。
-    请根据以下提供的 {symbol.upper()} 最新单日K线数据，提供简洁、专业的技术面分析。
+    您是一位專精於加密貨幣的資深技術分析師，擅長撰寫結構清晰、極具洞察力的市場報告。
 
-    **最新数据指标:**
+    請根據以下提供的 **{symbol.upper()}** 最新單日K線數據，並結合您對市場的理解，生成一份詳細的市場分析報告。請嚴格遵循下方的七大模塊結構，並使用簡體中文回答。
+
+    ---
+    ### **提供給您的最新數據指標:**
     - **日期:** {latest_data['Date']}
-    - **收盘价:** {latest_data['Close']:.4f}
-    - **20日均线 (SMA_20):** {latest_data['SMA_20']:.4f}
-    - **50日均线 (SMA_50):** {latest_data['SMA_50']:.4f}
-    - **14日相对强弱指数 (RSI_14):** {latest_data['RSI_14']:.2f}
-    - **MACD 指标:** MACD线({latest_data['MACD']:.4f}), 信号线({latest_data['MACD_Signal']:.4f})
+    - **收盤價:** {latest_data['Close']:.4f}
+    - **成交量:** {latest_data['Volume']:.2f}
+    - **20日均線 (SMA_20):** {latest_data.get('SMA_20', 'N/A'):.4f}
+    - **50日均線 (SMA_50):** {latest_data.get('SMA_50', 'N/A'):.4f}
+    - **14日相對強弱指數 (RSI_14):** {latest_data.get('RSI_14', 'N/A'):.2f}
+    - **MACD 指標 (12, 26, 9):**
+        - MACD線 (快線): {latest_data.get('MACD_12_26_9', 'N/A'):.4f}
+        - 訊號線 (慢線): {latest_data.get('MACDs_12_26_9', 'N/A'):.4f}
+        - 柱狀圖 (動能): {latest_data.get('MACDh_12_26_9', 'N/A'):.4f}
+    ---
 
-    **分析要求 (请用简体中文回答):**
-    1. **市场趋势:** 根据价格与MA均线的关系，判断目前是处于多头、空头还是盘整趋势？
-    2. **市场动能:** RSI值显示市场是处于超买、超卖还是中性区间？
-    3. **趋势信号:** MACD指标目前呈现了什么信号（例如：黄金交叉、死亡交叉）？
-    4. **综合评论:** 综合以上指标，给出一个简短的整体技术面前景总结。
+    ### **分析報告生成要求 (请严格遵循此结构):**
+
+    ### 一、六大致命信号
+    *请建立一个 Markdown 表格分析以下指标。如果某些数据（如买盘深度、OBV、持仓结构）无法从提供的数据中直接获取，请基于您的模型知识进行推断或标记为「需实时数据」。*
+    | **指标** | **当前值/状态** | **含义与风险** |
+    |---|---|---|
+    | **价格** | {latest_data['Close']:.4f} | (请分析价格走势，例如是否接近关键支撑/阻力) |
+    | **成交量** | {latest_data['Volume']:.1f} | (请分析成交量变化，是放量还是缩量，代表什么) |
+    | **买盘深度** | (推断或标记) | (请分析订单簿的健康状况) |
+    | **OBV** | (推断或标记) | (请分析资金流向) |
+    | **L.S结构** | (推断或标记) | (请分析多空持仓比例结构) |
+    | **O.I.数据** | (推断或标记) | (请分析未平仓合约数据及其风险) |
+
+    ---
+
+    ### 二、技术面：(请判断当前通道趋势，如“下跌通道加速”)
+    #### 关键价格锚点
+    *请列出并分析当前最重要的几个价格水平。*
+    ```
+    (例如: 8.000 ──┤ 周线阻力)
+    (例如: {latest_data['Close']:.4f} ──┤ 当前价)
+    (例如: 6.500 ──┤ 关键支撑)
+    ```
+    - **均线系统**: (请分析 MA(20), MA(50) 的排列和交叉情况，例如是否形成“瀑布式下压”)
+    - **终极警告**: (基于以上分析，给出一个最关键的风险提示)
+
+    ---
+
+    ### 三、主力行为解密：(请描述当前主力可能的意图，例如“请君入瓮”)
+    #### (例如：四步猎杀陷阱)
+    *请使用 Mermaid `graph TB` 流程图分析主力可能的行为路径。*
+    ```mermaid
+    graph TB
+    A[...] --> B[...]
+    B --> C[...]
+    C --> D[...]
+    ```
+    **当前阶段**: (请结合数据分析目前处于哪个阶段)
+
+    ---
+
+    ### 四、行情推演与概率
+    *请建立一个 Markdown 表格，推演未来最可能发生的三种情景。*
+    | **场景** | **概率** | **路径** | **触发条件** |
+    |---|---|---|---|
+    | **(情景1)** | (例如: 75%) | (描述价格可能路径) | (描述触发条件) |
+    | **(情景2)** | (例如: 20%) | (描述价格可能路径) | (描述触发条件) |
+    | **(情景3)** | (例如: 5%) | (描述价格可能路径) | (描述触发条件) |
+
+    ---
+
+    ### 五、紧急生存指南
+    #### （1）持有多单者
+    - **立即行动**: (给出明确操作建议)
+    #### （2）持有空单者
+    - **止盈策略**: (给出明确操作建议)
+    #### （3）空仓者
+    - **操作建议**: (给出明确操作建议，例如“绝对禁止抄底”或在何处开空)
+
+    ---
+
+    ### 六、末日观测锚点
+    *请列出 2-3 个需要密切关注的关键指标或事件。*
+    1. **(观测点1)**: (描述内容)
+    2. **(观测点2)**: (描述内容)
+
+    ---
+
+    ### 七、血泪教训总结
+    *请总结 2-3 个从当前行情中可以学到的关键教训。*
+    1. **(教训1)**: (描述内容)
+    2. **(教训2)**: (描述内容)
+
+    > ☠️ **终极警告**:
+    > (给出一个总结性的、最强烈的风险警告)
+    > **生存法则**:
+    > *"(用一句话总结生存法则)"*
     """
 
-    # 3. 根据 provider 选择调用的函数
-    analysis_text = ""
-    if provider == 'deepseek':
-        analysis_text = call_deepseek(prompt)
-    else: # provider == 'gemini'
-        analysis_text = call_gemini(prompt)
+    analysis_text = call_ai_provider(prompt, provider)
 
-    # 4. 组合最终的回应
-    # 使用 \r\n 作为换行符
-    formatted_analysis = analysis_text.replace('\n', '\r\n')
-    
     response_data = {
         "symbol": symbol.upper(),
         "analysis_provider": provider,
-        "latest_indicators": latest_data.to_dict(),
-        "ai_analysis": formatted_analysis
+        "latest_indicators": json.loads(latest_data.to_json()),
+        "ai_analysis": analysis_text
     }
     
-    # 使用 jsonify 并设置响应头
     response = jsonify(response_data)
-    response.headers['Content-Type'] = 'application/json; charset=utf-8'
     response.headers['Access-Control-Allow-Origin'] = '*'
-    response.headers['Access-Control-Allow-Methods'] = 'GET'
     
     return response
 
-
-# --- 4. 启动应用 ---
+# --- 4. 啟動應用 ---
 if __name__ == '__main__':
+    # 建議使用 gunicorn 等生產級伺服器部署，debug=True 僅適用於開發環境
     app.run(host='0.0.0.0', port=5001, debug=True)
+
